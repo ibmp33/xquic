@@ -795,7 +795,12 @@ xqc_write_conn_close_to_packet(xqc_connection_t *conn, uint64_t err_code)
         return -XQC_EWRITE_PKT;
     }
 
-    ret = xqc_gen_conn_close_frame(packet_out, err_code, err_code >= H3_NO_ERROR ? 1:0, 0);
+    /* QUIC CRYPTO_ERROR shares the numeric range 0x0100-0x01ff with HTTP/3 errors,
+     * so transport vs application close cannot be inferred from err_code alone.
+     * HTTP/3/QPACK paths explicitly mark application close on the connection.
+     */
+    ret = xqc_gen_conn_close_frame(packet_out, err_code,
+        (conn->conn_flag & XQC_CONN_FLAG_APPLICATION_CLOSE) ? 1 : 0, 0);
     if (ret < 0) {
         xqc_log(conn->log, XQC_LOG_ERROR, "|xqc_gen_conn_close_frame error|");
         goto error;

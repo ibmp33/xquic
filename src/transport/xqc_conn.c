@@ -6268,8 +6268,7 @@ xqc_int_t
 xqc_conn_tls_alpn_select_cb(const char *alpn, size_t alpn_len, void *user_data)
 {
     xqc_connection_t *conn = (xqc_connection_t *)user_data;
-    xqc_conn_server_on_alpn(conn, alpn, alpn_len);
-    return XQC_OK;
+    return xqc_conn_server_on_alpn(conn, alpn, alpn_len);
 }
 
 xqc_int_t

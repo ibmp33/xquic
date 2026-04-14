@@ -19,6 +19,7 @@
     if (h3_conn->conn->conn_err == 0 && ret <= -XQC_H3_EMALLOC) {   \
         h3_conn->conn->conn_err = err;                              \
         h3_conn->conn->conn_flag |= XQC_CONN_FLAG_ERROR;            \
+        h3_conn->conn->conn_flag |= XQC_CONN_FLAG_APPLICATION_CLOSE;\
         xqc_log(h3_conn->conn->log, XQC_LOG_ERROR, "|conn:%p|err:0x%xi|ret:%i|%s|", \
                 h3_conn->conn, h3_conn->conn->conn_err, (int64_t)ret,   \
                 xqc_conn_addr_str(h3_conn->conn));                  \

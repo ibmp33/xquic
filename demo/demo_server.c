@@ -18,6 +18,7 @@
 #include "../tests/platform.h"
 
 #ifndef XQC_SYS_WINDOWS
+#include <getopt.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #else
@@ -58,6 +59,7 @@ typedef struct xqc_demo_svr_net_config_s {
     int     addr_len;
     char    ip[64];
     short   port;
+    int     listen_specified;
 
     /* ipv4 or ipv6 */
     int     ipv6;
@@ -131,6 +133,7 @@ typedef struct xqc_demo_svr_quic_config_s {
  */
 
 #define LOG_PATH "slog.log"
+#define QLOG_DIR ""
 #define KEY_PATH "skeys.log"
 #define SOURCE_DIR  "."
 #define PRIV_KEY_PATH "server.key"
@@ -143,6 +146,7 @@ typedef struct xqc_demo_svr_env_config_s {
     /* log path */
     char    log_path[PATH_LEN];
     int     log_level;
+    char    qlog_dir[PATH_LEN];
 
     /* source file dir */
     char    source_file_dir[RESOURCE_LEN];
@@ -192,7 +196,9 @@ typedef struct xqc_demo_svr_ctx_s {
     int                 current_fd;
 
     int                 log_fd;
+    int                 qlog_fd;
     int                 keylog_fd;
+    xqc_usec_t          qlog_start_us;
 
     xqc_demo_svr_args_t *args;
 } xqc_demo_svr_ctx_t;
@@ -279,12 +285,43 @@ xqc_demo_svr_open_log_file(xqc_demo_svr_ctx_t *ctx)
 }
 
 int
+xqc_demo_svr_open_qlog_file(xqc_demo_svr_ctx_t *ctx)
+{
+    char qlog_path[PATH_LEN * 2] = {0};
+
+    if (ctx->args->env_cfg.qlog_dir[0] == '\0') {
+        ctx->qlog_fd = 0;
+        return 0;
+    }
+
+    snprintf(qlog_path, sizeof(qlog_path), "%s/server.qlog", ctx->args->env_cfg.qlog_dir);
+    ctx->qlog_fd = open(qlog_path, (O_WRONLY | O_APPEND | O_CREAT), 0644);
+    if (ctx->qlog_fd <= 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+int
 xqc_demo_svr_close_log_file(xqc_demo_svr_ctx_t *ctx)
 {
     if (ctx->log_fd <= 0) {
         return -1;
     }
     close(ctx->log_fd);
+    return 0;
+}
+
+int
+xqc_demo_svr_close_qlog_file(xqc_demo_svr_ctx_t *ctx)
+{
+    if (ctx->qlog_fd <= 0) {
+        return -1;
+    }
+
+    close(ctx->qlog_fd);
+    ctx->qlog_fd = 0;
     return 0;
 }
 
@@ -311,16 +348,53 @@ void
 xqc_demo_svr_write_qlog_file(qlog_event_importance_t imp, const void *buf, size_t size, void *eng_user_data)
 {
     xqc_demo_svr_ctx_t *ctx = (xqc_demo_svr_ctx_t*)eng_user_data;
-    if (ctx->log_fd <= 0) {
+    int fd = ctx->qlog_fd > 0 ? ctx->qlog_fd : ctx->log_fd;
+    if (fd <= 0) {
         return;
     }
 
-    int write_len = write(ctx->log_fd, buf, size);
+    const char *src = (const char *)buf;
+    const char *payload = src;
+    size_t payload_len = size;
+    char prefix[32];
+    int prefix_len;
+
+    if (ctx->qlog_start_us == 0) {
+        ctx->qlog_start_us = xqc_now();
+    }
+
+    if (size > 0 && src[0] == '[') {
+        const char *right_bracket = memchr(src, ']', size);
+        if (right_bracket != NULL) {
+            payload = right_bracket + 1;
+            payload_len = size - (payload - src);
+            if (payload_len > 0 && payload[0] == ' ') {
+                payload++;
+                payload_len--;
+            }
+        }
+    }
+
+    prefix_len = snprintf(prefix, sizeof(prefix), "[%.3f] ",
+        (double)(xqc_now() - ctx->qlog_start_us) / 1000.0);
+    if (prefix_len < 0) {
+        printf("write qlog failed, errno: %d\n", get_sys_errno());
+        return;
+    }
+
+    int write_len = write(fd, prefix, prefix_len);
     if (write_len < 0) {
         printf("write qlog failed, errno: %d\n", get_sys_errno());
         return;
     }
-    write_len = write(ctx->log_fd, line_break, 1);
+
+    write_len = write(fd, payload, payload_len);
+    if (write_len < 0) {
+        printf("write qlog failed, errno: %d\n", get_sys_errno());
+        return;
+    }
+
+    write_len = write(fd, line_break, 1);
     if (write_len < 0) {
         printf("write qlog failed, errno: %d\n", get_sys_errno());
     }
@@ -1170,6 +1244,45 @@ err:
 static int
 xqc_demo_svr_create_socket(xqc_demo_svr_ctx_t *ctx, xqc_demo_svr_net_config_t* cfg)
 {
+    int ret;
+
+    if (cfg->listen_specified) {
+        if (cfg->ipv6) {
+            memset(&ctx->local_addr6, 0, sizeof(ctx->local_addr6));
+            ctx->local_addr6.sin6_family = AF_INET6;
+            ctx->local_addr6.sin6_port = htons(cfg->port);
+            ret = inet_pton(AF_INET6, cfg->ip, &ctx->local_addr6.sin6_addr);
+            if (ret != 1) {
+                printf("invalid ipv6 listen address: %s\n", cfg->ip);
+                return -1;
+            }
+
+            ctx->local_addrlen6 = sizeof(ctx->local_addr6);
+            ctx->fd6 = xqc_demo_svr_init_socket(AF_INET6, cfg->port,
+                (struct sockaddr*)&ctx->local_addr6, ctx->local_addrlen6);
+            ctx->fd = -1;
+            printf("create ipv6 socket fd: %d\n", ctx->fd6);
+            return ctx->fd6 < 0 ? -1 : 0;
+
+        } else {
+            memset(&ctx->local_addr, 0, sizeof(ctx->local_addr));
+            ctx->local_addr.sin_family = AF_INET;
+            ctx->local_addr.sin_port = htons(cfg->port);
+            ret = inet_pton(AF_INET, cfg->ip, &ctx->local_addr.sin_addr);
+            if (ret != 1) {
+                printf("invalid ipv4 listen address: %s\n", cfg->ip);
+                return -1;
+            }
+
+            ctx->local_addrlen = sizeof(ctx->local_addr);
+            ctx->fd = xqc_demo_svr_init_socket(AF_INET, cfg->port,
+                (struct sockaddr*)&ctx->local_addr, ctx->local_addrlen);
+            ctx->fd6 = -1;
+            printf("create ipv4 socket fd: %d\n", ctx->fd);
+            return ctx->fd < 0 ? -1 : 0;
+        }
+    }
+
     /* ipv4 socket */
     memset(&ctx->local_addr, 0, sizeof(ctx->local_addr));
     ctx->local_addr.sin_family = AF_INET;
@@ -1190,7 +1303,7 @@ xqc_demo_svr_create_socket(xqc_demo_svr_ctx_t *ctx, xqc_demo_svr_net_config_t* c
         ctx->local_addrlen6);
     printf("create ipv6 socket fd: %d\n", ctx->fd6);
 
-    if (!ctx->fd && !ctx->fd6) {
+    if (ctx->fd < 0 && ctx->fd6 < 0) {
         return -1;
     }
 
@@ -1221,9 +1334,11 @@ xqc_demo_svr_usage(int argc, char *argv[])
             "Options:\n"
             "   -p    Server port.\n"
             "   -c    Congestion Control Algorithm. r:reno b:bbr c:cubic P:copa \n"
+            "         Long form: --congestion-control=reno|bbr|cubic|copa\n"
             "   -C    Pacing on.\n"
             "   -l    Log level. e:error d:debug.\n"
             "   -L    xquic log directory.\n"
+            "   -D    Server resource root directory.\n"
             "   -6    IPv6\n"
             "   -k    Key output file path\n"
             "   -r    retry\n"
@@ -1235,7 +1350,79 @@ xqc_demo_svr_usage(int argc, char *argv[])
             "   -R    Reinjection (1,2,4) \n"
             "   -u    Keyupdate packet threshold\n"
             "   -F    MTU size (default: 1200)\n"
+            "   --listen      Listen address, e.g. 0.0.0.0:4433\n"
+            "   --cert        TLS certificate path\n"
+            "   --key         TLS private key path\n"
+            "   --root        Server resource root directory\n"
+            "   --qlog-dir    Directory for qlog output\n"
             , prog);
+}
+
+static int
+xqc_demo_svr_parse_cc(const char *name, CC_TYPE *cc)
+{
+    if (strcmp(name, "b") == 0 || strcmp(name, "bbr") == 0) {
+        *cc = CC_TYPE_BBR;
+        return 0;
+    }
+
+    if (strcmp(name, "c") == 0 || strcmp(name, "cubic") == 0) {
+        *cc = CC_TYPE_CUBIC;
+        return 0;
+    }
+
+    if (strcmp(name, "r") == 0 || strcmp(name, "reno") == 0) {
+        *cc = CC_TYPE_RENO;
+        return 0;
+    }
+
+    if (strcmp(name, "P") == 0 || strcmp(name, "copa") == 0) {
+        *cc = CC_TYPE_COPA;
+        return 0;
+    }
+
+    return -1;
+}
+
+static int
+xqc_demo_svr_parse_listen(const char *listen, xqc_demo_svr_net_config_t *cfg)
+{
+    const char *port_sep = strrchr(listen, ':');
+    size_t host_len;
+
+    if (port_sep == NULL || *(port_sep + 1) == '\0') {
+        return -1;
+    }
+
+    if (listen[0] == '[') {
+        const char *end = strchr(listen, ']');
+        if (end == NULL || end > port_sep) {
+            return -1;
+        }
+
+        host_len = (size_t)(end - listen - 1);
+        if (host_len >= sizeof(cfg->ip)) {
+            return -1;
+        }
+
+        memcpy(cfg->ip, listen + 1, host_len);
+        cfg->ip[host_len] = '\0';
+        cfg->ipv6 = 1;
+
+    } else {
+        host_len = (size_t)(port_sep - listen);
+        if (host_len == 0 || host_len >= sizeof(cfg->ip)) {
+            return -1;
+        }
+
+        memcpy(cfg->ip, listen, host_len);
+        cfg->ip[host_len] = '\0';
+        cfg->ipv6 = strchr(cfg->ip, ':') != NULL;
+    }
+
+    cfg->port = atoi(port_sep + 1);
+    cfg->listen_specified = cfg->port > 0;
+    return cfg->port > 0 ? 0 : -1;
 }
 
 
@@ -1257,6 +1444,7 @@ xqc_demo_svr_init_args(xqc_demo_svr_args_t *args)
     /* net cfg */
     strncpy(args->net_cfg.ip, DEFAULT_IP, sizeof(args->net_cfg.ip) - 1);
     args->net_cfg.port = DEFAULT_PORT;
+    args->net_cfg.cc = CC_TYPE_CUBIC;
 
     /* quic cfg */
     xqc_demo_svr_init_0rtt(args);
@@ -1266,6 +1454,7 @@ xqc_demo_svr_init_args(xqc_demo_svr_args_t *args)
     /* env cfg */
     args->env_cfg.log_level = XQC_LOG_DEBUG;
     strncpy(args->env_cfg.log_path, LOG_PATH, TLS_GROUPS_LEN - 1);
+    strncpy(args->env_cfg.qlog_dir, QLOG_DIR, PATH_LEN - 1);
     strncpy(args->env_cfg.source_file_dir, SOURCE_DIR, RESOURCE_LEN - 1);
     strncpy(args->env_cfg.key_out_path, KEY_PATH, PATH_LEN - 1);
     strncpy(args->env_cfg.priv_key_path, PRIV_KEY_PATH, PATH_LEN - 1);
@@ -1280,8 +1469,63 @@ void
 xqc_demo_svr_parse_args(int argc, char *argv[], xqc_demo_svr_args_t *args)
 {
     int ch = 0;
-    while ((ch = getopt(argc, argv, "p:c:CD:l:L:6k:rdMiPs:R:u:a:F:f:")) != -1) {
+    enum {
+        XQC_DEMO_OPT_LISTEN = 1000,
+        XQC_DEMO_OPT_CERT,
+        XQC_DEMO_OPT_KEY,
+        XQC_DEMO_OPT_ROOT,
+        XQC_DEMO_OPT_QLOG_DIR,
+        XQC_DEMO_OPT_CC,
+    };
+
+    const struct option long_opts[] = {
+        {"listen", required_argument, NULL, XQC_DEMO_OPT_LISTEN},
+        {"cert", required_argument, NULL, XQC_DEMO_OPT_CERT},
+        {"key", required_argument, NULL, XQC_DEMO_OPT_KEY},
+        {"root", required_argument, NULL, XQC_DEMO_OPT_ROOT},
+        {"qlog-dir", required_argument, NULL, XQC_DEMO_OPT_QLOG_DIR},
+        {"congestion-control", required_argument, NULL, XQC_DEMO_OPT_CC},
+        {0, 0, 0, 0}
+    };
+
+    while ((ch = getopt_long(argc, argv, "p:c:CD:l:L:6k:rdMiPs:R:u:a:F:f:", long_opts, NULL)) != -1) {
         switch (ch) {
+        case XQC_DEMO_OPT_LISTEN:
+            printf("option listen :%s\n", optarg);
+            if (xqc_demo_svr_parse_listen(optarg, &args->net_cfg) != 0) {
+                printf("invalid listen address: %s\n", optarg);
+                exit(1);
+            }
+            break;
+
+        case XQC_DEMO_OPT_CERT:
+            printf("option cert :%s\n", optarg);
+            strncpy(args->env_cfg.cert_pem_path, optarg, sizeof(args->env_cfg.cert_pem_path) - 1);
+            break;
+
+        case XQC_DEMO_OPT_KEY:
+            printf("option key :%s\n", optarg);
+            strncpy(args->env_cfg.priv_key_path, optarg, sizeof(args->env_cfg.priv_key_path) - 1);
+            break;
+
+        case XQC_DEMO_OPT_ROOT:
+            printf("option root :%s\n", optarg);
+            strncpy(args->env_cfg.source_file_dir, optarg, RESOURCE_LEN - 1);
+            break;
+
+        case XQC_DEMO_OPT_QLOG_DIR:
+            printf("option qlog directory :%s\n", optarg);
+            strncpy(args->env_cfg.qlog_dir, optarg, sizeof(args->env_cfg.qlog_dir) - 1);
+            break;
+
+        case XQC_DEMO_OPT_CC:
+            printf("option congestion-control :%s\n", optarg);
+            if (xqc_demo_svr_parse_cc(optarg, &args->net_cfg.cc) != 0) {
+                printf("unsupported congestion control: %s\n", optarg);
+                exit(1);
+            }
+            break;
+
         /* listen port */
         case 'p':
             printf("option port :%s\n", optarg);
@@ -1291,22 +1535,9 @@ xqc_demo_svr_parse_args(int argc, char *argv[], xqc_demo_svr_args_t *args)
         /* congestion control */
         case 'c':
             printf("option cong_ctl :%s\n", optarg);
-            /* r:reno b:bbr c:cubic P:copa */
-            switch (*optarg) {
-            case 'b':
-                args->net_cfg.cc = CC_TYPE_BBR;
-                break;
-            case 'c':
-                args->net_cfg.cc = CC_TYPE_CUBIC;
-                break;
-            case 'r':
-                args->net_cfg.cc = CC_TYPE_RENO;
-                break;
-            case 'P':
-                args->net_cfg.cc = CC_TYPE_COPA;
-                break;
-            default:
-                break;
+            if (xqc_demo_svr_parse_cc(optarg, &args->net_cfg.cc) != 0) {
+                printf("unsupported congestion control: %s\n", optarg);
+                exit(1);
             }
             break;
 
@@ -1458,6 +1689,7 @@ xqc_demo_svr_init_ctx(xqc_demo_svr_ctx_t *ctx, xqc_demo_svr_args_t *args)
     ctx->current_fd = -1;
     ctx->args = args;
     xqc_demo_svr_open_log_file(ctx);
+    xqc_demo_svr_open_qlog_file(ctx);
     xqc_demo_svr_open_keylog_file(ctx);
 }
 
@@ -1524,7 +1756,7 @@ xqc_demo_svr_init_conn_settings(xqc_engine_t *engine, xqc_demo_svr_args_t *args)
         .cong_ctrl_callback = ccc,
         .cc_params = {
             .customize_on = 1,
-            .init_cwnd = 32,
+            .init_cwnd = 10,
             .bbr_enable_lt_bw = 1,
         },
         .spurious_loss_detect_on = 1,
@@ -1612,7 +1844,7 @@ xqc_demo_svr_init_xquic_engine(xqc_demo_svr_ctx_t *ctx, xqc_demo_svr_args_t *arg
 
     /* init engine config */
     xqc_config_t config;
-    if (xqc_engine_get_default_config(&config, XQC_ENGINE_CLIENT) < 0) {
+    if (xqc_engine_get_default_config(&config, XQC_ENGINE_SERVER) < 0) {
         return XQC_ERROR;
     }
 
@@ -1671,6 +1903,7 @@ void
 xqc_demo_svr_free_ctx(xqc_demo_svr_ctx_t *ctx)
 {
     xqc_demo_svr_close_keylog_file(ctx);
+    xqc_demo_svr_close_qlog_file(ctx);
     xqc_demo_svr_close_log_file(ctx);
 
     if (ctx->args) {
@@ -1726,19 +1959,25 @@ main(int argc, char *argv[])
     }
 
     /* socket event */
-    ctx->ev_socket = event_new(eb, ctx->fd, EV_READ | EV_PERSIST,
-        xqc_demo_svr_socket_event_callback, ctx);
-    event_add(ctx->ev_socket, NULL);
+    if (ctx->fd >= 0) {
+        ctx->ev_socket = event_new(eb, ctx->fd, EV_READ | EV_PERSIST,
+            xqc_demo_svr_socket_event_callback, ctx);
+        event_add(ctx->ev_socket, NULL);
+    }
 
     /* socket event */
-    ctx->ev_socket6 = event_new(eb, ctx->fd6, EV_READ | EV_PERSIST,
-        xqc_demo_svr_socket_event_callback, ctx);
-    event_add(ctx->ev_socket6, NULL);
+    if (ctx->fd6 >= 0) {
+        ctx->ev_socket6 = event_new(eb, ctx->fd6, EV_READ | EV_PERSIST,
+            xqc_demo_svr_socket_event_callback, ctx);
+        event_add(ctx->ev_socket6, NULL);
+    }
 
     event_base_dispatch(eb);
 
     xqc_engine_destroy(ctx->engine);
-    // xqc_demo_svr_free_ctx(ctx);
+    xqc_demo_svr_close_keylog_file(ctx);
+    xqc_demo_svr_close_qlog_file(ctx);
+    xqc_demo_svr_close_log_file(ctx);
 
     return 0;
 }
